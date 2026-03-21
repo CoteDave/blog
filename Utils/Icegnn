@@ -1,0 +1,764 @@
+from __future__ import annotations
+
+import math
+import copy
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional, Union, List, Dict, Any, Tuple
+
+from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.validation import check_is_fitted
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
+def _to_numpy(x):
+    if x is None:
+        return None
+    if isinstance(x, np.ndarray):
+        return x
+    if hasattr(x, "to_numpy"):
+        return x.to_numpy()
+    return np.asarray(x)
+
+
+def _is_binary_labels(y: np.ndarray) -> bool:
+    uniq = np.unique(y)
+    return len(uniq) == 2
+
+
+def _safe_sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _make_feature_names(x, feature_names=None):
+    if feature_names is not None:
+        return list(feature_names)
+    if hasattr(x, "columns"):
+        return list(x.columns)
+    return [f"x{i}" for i in range(_to_numpy(x).shape[1])]
+
+
+def _quantile_grid(x_col: np.ndarray, grid_size: int) -> np.ndarray:
+    qs = np.linspace(0.01, 0.99, grid_size)
+    vals = np.quantile(x_col, qs)
+    vals = np.unique(vals)
+    if len(vals) < grid_size:
+        # fallback if constant / few unique values
+        vmin, vmax = np.min(x_col), np.max(x_col)
+        vals = np.linspace(vmin, vmax, grid_size)
+    return vals.astype(np.float32)
+
+
+def _uniform_grid(x_col: np.ndarray, grid_size: int) -> np.ndarray:
+    vmin, vmax = np.min(x_col), np.max(x_col)
+    if np.isclose(vmin, vmax):
+        return np.repeat(np.float32(vmin), grid_size)
+    return np.linspace(vmin, vmax, grid_size).astype(np.float32)
+
+
+# ============================================================
+# Pretrained learner adapter
+# ============================================================
+
+class _PretrainedLearnerAdapter:
+    """
+    Adapter minimal pour modèle sklearn/CatBoost/LightGBM/XGBoost-like.
+    - regression: predict -> (n,)
+    - binary classification: predict_proba -> (n,2)
+    - multiclass classification: predict_proba -> (n,C)
+    """
+
+    def __init__(self, model, task: str):
+        self.model = model
+        self.task = task
+
+    def predict_regression(self, X: np.ndarray) -> np.ndarray:
+        pred = self.model.predict(X)
+        pred = np.asarray(pred)
+        return pred.reshape(-1, 1).astype(np.float32)
+
+    def predict_classification_proba(self, X: np.ndarray) -> np.ndarray:
+        if hasattr(self.model, "predict_proba"):
+            proba = self.model.predict_proba(X)
+            proba = np.asarray(proba).astype(np.float32)
+            if proba.ndim == 1:
+                proba = proba.reshape(-1, 1)
+            return proba
+
+        if hasattr(self.model, "decision_function"):
+            logits = self.model.decision_function(X)
+            logits = np.asarray(logits)
+            if logits.ndim == 1:
+                p1 = _safe_sigmoid(logits)
+                return np.stack([1.0 - p1, p1], axis=1).astype(np.float32)
+            exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+            return (exp_logits / np.sum(exp_logits, axis=1, keepdims=True)).astype(np.float32)
+
+        # fallback very generic
+        pred = self.model.predict(X)
+        pred = np.asarray(pred)
+        if pred.ndim == 1:
+            pred = pred.reshape(-1, 1)
+        if pred.shape[1] == 1:
+            p1 = np.clip(pred[:, 0], 0.0, 1.0)
+            return np.stack([1.0 - p1, p1], axis=1).astype(np.float32)
+        return pred.astype(np.float32)
+
+    def predict_batch(self, X: np.ndarray) -> np.ndarray:
+        if self.task == "regression":
+            return self.predict_regression(X)
+        return self.predict_classification_proba(X)
+
+
+# ============================================================
+# ICE computation
+# ============================================================
+
+@dataclass
+class ICECache:
+    grid_values: List[np.ndarray]
+    raw_grid_values: Optional[List[np.ndarray]] = None
+
+
+class ICECurveComputer:
+    """
+    Compute ICE curves once the grid is known.
+    Output shape:
+      - regression:   (n_samples, n_features, grid_size, 1)
+      - classification: (n_samples, n_features, grid_size, n_outputs)
+        where n_outputs = 1 for binary positive-class proba,
+        and n_outputs = n_classes for multiclass.
+    """
+
+    def __init__(
+        self,
+        pretrained_learner,
+        task: str,
+        grid_size: int = 20,
+        grid_strategy: str = "quantile",
+        ice_max_samples: Optional[int] = 2048,
+        batch_size: int = 2048,
+        random_state: int = 42,
+    ):
+        self.adapter = _PretrainedLearnerAdapter(pretrained_learner, task)
+        self.task = task
+        self.grid_size = grid_size
+        self.grid_strategy = grid_strategy
+        self.ice_max_samples = ice_max_samples
+        self.batch_size = batch_size
+        self.random_state = random_state
+
+    def fit_grids(self, X: np.ndarray, X_raw: Optional[np.ndarray] = None) -> ICECache:
+        n_features = X.shape[1]
+        grid_values = []
+        raw_grid_values = [] if X_raw is not None else None
+
+        for j in range(n_features):
+            xj = X[:, j]
+            if self.grid_strategy == "uniform":
+                grid = _uniform_grid(xj, self.grid_size)
+            else:
+                grid = _quantile_grid(xj, self.grid_size)
+            grid_values.append(grid)
+
+            if X_raw is not None:
+                xrj = X_raw[:, j]
+                if self.grid_strategy == "uniform":
+                    raw_grid = _uniform_grid(xrj, len(grid))
+                else:
+                    raw_grid = _quantile_grid(xrj, len(grid))
+                raw_grid_values.append(raw_grid)
+
+        return ICECache(grid_values=grid_values, raw_grid_values=raw_grid_values)
+
+    def _batched_predict(self, X: np.ndarray) -> np.ndarray:
+        # Some learners are faster on big batches, but we keep batching as a safe default.
+        outs = []
+        n = X.shape[0]
+        for start in range(0, n, self.batch_size):
+            end = min(start + self.batch_size, n)
+            chunk = X[start:end]
+            outs.append(self.adapter.predict_batch(chunk))
+        return np.concatenate(outs, axis=0)
+
+    def compute(
+        self,
+        X: np.ndarray,
+        grid_cache: ICECache,
+        y: Optional[np.ndarray] = None,
+        sample_size: Optional[int] = None,
+    ) -> np.ndarray:
+        X = _to_numpy(X).astype(np.float32)
+        n_samples, n_features = X.shape
+
+        if sample_size is None:
+            sample_size = self.ice_max_samples if self.ice_max_samples is not None else n_samples
+
+        if sample_size < n_samples:
+            rng = np.random.default_rng(self.random_state)
+            idx = rng.choice(n_samples, size=sample_size, replace=False)
+            Xs = X[idx]
+            ys = None if y is None else _to_numpy(y)[idx]
+        else:
+            idx = np.arange(n_samples)
+            Xs = X
+            ys = None if y is None else _to_numpy(y)
+
+        # infer output dimension
+        first_pred = self.adapter.predict_batch(Xs[: min(16, len(Xs))])
+        out_dim = 1 if first_pred.ndim == 1 else first_pred.shape[1]
+        if first_pred.ndim == 1:
+            first_pred = first_pred.reshape(-1, 1)
+            out_dim = 1
+
+        curves = np.empty((Xs.shape[0], n_features, len(grid_cache.grid_values[0]), out_dim), dtype=np.float32)
+
+        for j in range(n_features):
+            grid = grid_cache.grid_values[j]
+            grid_preds = []
+            for v in grid:
+                Xm = Xs.copy()
+                Xm[:, j] = v
+                pred = self._batched_predict(Xm)
+                if pred.ndim == 1:
+                    pred = pred.reshape(-1, 1)
+                grid_preds.append(pred.astype(np.float32))
+            # (grid, n_samples, out_dim) -> (n_samples, grid, out_dim)
+            grid_preds = np.stack(grid_preds, axis=0).transpose(1, 0, 2)
+            curves[:, j, :, :] = grid_preds
+
+        return curves
+
+
+# ============================================================
+# Graph blocks (feature graph = nodes are features)
+# ============================================================
+
+class CurveEncoder(nn.Module):
+    def __init__(self, curve_dim: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(curve_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class GraphAttentionBlock(nn.Module):
+    """
+    Dense feature-graph attention with an optional prior bias matrix.
+    h: (B, F, D)
+    prior_bias: (F, F) or None
+    """
+
+    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        self.out = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        self.last_attn_ = None
+
+    def forward(self, h: torch.Tensor, prior_bias: Optional[torch.Tensor] = None):
+        # h: (B, F, D)
+        B, F, D = h.shape
+        q = self.q(h)
+        k = self.k(h)
+        v = self.v(h)
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(D)  # (B, F, F)
+        if prior_bias is not None:
+            scores = scores + prior_bias.unsqueeze(0)
+
+        attn = torch.softmax(scores, dim=-1)
+        self.last_attn_ = attn.detach()
+
+        msg = torch.matmul(attn, v)  # (B, F, D)
+        h = self.norm1(h + self.dropout(self.out(msg)))
+        h = self.norm2(h + self.dropout(self.ffn(h)))
+        return h, attn
+
+
+class IceGNNBackbone(nn.Module):
+    def __init__(
+        self,
+        curve_dim: int,
+        hidden_dim: int,
+        n_graph_layers: int,
+        dropout: float,
+        out_dim: int,
+    ):
+        super().__init__()
+        self.encoder = CurveEncoder(curve_dim=curve_dim, hidden_dim=hidden_dim, dropout=dropout)
+        self.graph_blocks = nn.ModuleList(
+            [GraphAttentionBlock(hidden_dim=hidden_dim, dropout=dropout) for _ in range(n_graph_layers)]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, curves: torch.Tensor, prior_bias: Optional[torch.Tensor] = None):
+        """
+        curves: (B, F, C)  where C = curve_dim
+        """
+        h = self.encoder(curves)  # (B, F, D)
+        attns = []
+        for block in self.graph_blocks:
+            h, attn = block(h, prior_bias=prior_bias)
+            attns.append(attn)
+
+        global_emb = h.mean(dim=1)      # (B, D)
+        logits = self.head(global_emb)  # (B, out_dim)
+
+        return logits, global_emb, h, attns
+
+
+# ============================================================
+# Base estimator
+# ============================================================
+
+class IceGNNBase(BaseEstimator):
+    def __init__(
+        self,
+        pretrained_learner,
+        task: str,
+        eval_size: float = 0.15,
+        patience: int = 3,
+        lr: float = 1e-3,
+        epochs: int = 50,
+        batch_size: int = 128,
+        hidden_dim: int = 64,
+        n_graph_layers: int = 2,
+        dropout: float = 0.10,
+        grid_size: int = 20,
+        grid_strategy: str = "quantile",
+        ice_max_samples: Optional[int] = 2048,
+        random_state: int = 42,
+        verbose: bool = True,
+        device: Optional[str] = None,
+    ):
+        self.pretrained_learner = pretrained_learner
+        self.task = task
+        self.eval_size = eval_size
+        self.patience = patience
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.hidden_dim = hidden_dim
+        self.n_graph_layers = n_graph_layers
+        self.dropout = dropout
+        self.grid_size = grid_size
+        self.grid_strategy = grid_strategy
+        self.ice_max_samples = ice_max_samples
+        self.random_state = random_state
+        self.verbose = verbose
+        self.device = device
+
+    def _device(self):
+        if self.device is not None:
+            return torch.device(self.device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _build_prior_bias(self, X: np.ndarray) -> torch.Tensor:
+        # Fast, simple prior graph from absolute correlation.
+        # This helps the attention layer converge faster.
+        X = _to_numpy(X).astype(np.float32)
+        corr = np.corrcoef(X, rowvar=False)
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+        corr = np.abs(corr).astype(np.float32)
+        np.fill_diagonal(corr, 0.0)
+
+        # Turn into additive attention bias. Small epsilon to avoid log(0).
+        bias = np.log(corr + 1e-3)
+        bias = torch.tensor(bias, dtype=torch.float32, device=self._device())
+        return bias
+
+    def _pack_curves(self, curves: np.ndarray) -> np.ndarray:
+        # curves: (N, F, G, O) -> (N, F, G*O)
+        N, F_, G, O = curves.shape
+        return curves.reshape(N, F_, G * O).astype(np.float32)
+
+    def _prepare_y(self, y):
+        y = _to_numpy(y)
+        if self.task == "classification":
+            y_enc = self.label_encoder_.transform(y)
+            return y_enc
+        return y.astype(np.float32)
+
+    def _make_loss(self):
+        if self.task == "regression":
+            return nn.MSELoss()
+        if self.n_classes_ == 2:
+            return nn.BCEWithLogitsLoss()
+        return nn.CrossEntropyLoss()
+
+    def _model_output_dim(self):
+        if self.task == "regression":
+            return 1
+        if self.n_classes_ == 2:
+            return 1
+        return self.n_classes_
+
+    def _forward_batch(self, X_curves_t: torch.Tensor):
+        return self.model_(X_curves_t, prior_bias=self.prior_bias_)
+
+    def _predict_from_curves(self, curves: np.ndarray):
+        self.model_.eval()
+        device = self._device()
+        X_t = torch.tensor(curves, dtype=torch.float32, device=device)
+        outs = []
+        with torch.no_grad():
+            for start in range(0, X_t.shape[0], self.batch_size):
+                end = min(start + self.batch_size, X_t.shape[0])
+                logits, global_emb, feat_emb, attns = self.model_(X_t[start:end], prior_bias=self.prior_bias_)
+                outs.append((logits, global_emb, feat_emb, attns))
+
+        logits = torch.cat([o[0] for o in outs], dim=0)
+        global_emb = torch.cat([o[1] for o in outs], dim=0)
+        feat_emb = torch.cat([o[2] for o in outs], dim=0)
+
+        return logits, global_emb, feat_emb
+
+    def fit(self, X, y, X_raw: Optional[np.ndarray] = None, feature_names: Optional[List[str]] = None):
+        X = _to_numpy(X).astype(np.float32)
+        y = _to_numpy(y)
+        X_raw = _to_numpy(X_raw) if X_raw is not None else None
+
+        self.n_features_in_ = X.shape[1]
+        self.feature_names_ = _make_feature_names(X if feature_names is None else feature_names, feature_names)
+
+        if self.task == "classification":
+            self.label_encoder_ = LabelEncoder()
+            self.label_encoder_.fit(y)
+            y_enc = self.label_encoder_.transform(y)
+            self.classes_ = self.label_encoder_.classes_
+            self.n_classes_ = len(self.classes_)
+        else:
+            self.label_encoder_ = None
+            self.classes_ = None
+            self.n_classes_ = 1
+            y_enc = y.astype(np.float32)
+
+        self.ice_computer_ = ICECurveComputer(
+            pretrained_learner=self.pretrained_learner,
+            task=self.task,
+            grid_size=self.grid_size,
+            grid_strategy=self.grid_strategy,
+            ice_max_samples=self.ice_max_samples,
+            batch_size=max(256, self.batch_size),
+            random_state=self.random_state,
+        )
+
+        self.grid_cache_ = self.ice_computer_.fit_grids(X, X_raw=X_raw)
+
+        curves = self.ice_computer_.compute(
+            X,
+            grid_cache=self.grid_cache_,
+            y=y_enc,
+            sample_size=self.ice_max_samples,
+        )
+        self.curve_output_dim_ = curves.shape[-1]
+        Xg = self._pack_curves(curves)
+
+        self.prior_bias_ = self._build_prior_bias(X)
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            Xg,
+            y_enc,
+            test_size=self.eval_size,
+            random_state=self.random_state,
+            stratify=y_enc if self.task == "classification" and len(np.unique(y_enc)) > 1 else None,
+        )
+
+        device = self._device()
+        self.model_ = IceGNNBackbone(
+            curve_dim=Xg.shape[-1],
+            hidden_dim=self.hidden_dim,
+            n_graph_layers=self.n_graph_layers,
+            dropout=self.dropout,
+            out_dim=self._model_output_dim(),
+        ).to(device)
+
+        if self.task == "classification" and self.n_classes_ > 2:
+            y_train_t = torch.tensor(y_train, dtype=torch.long, device=device)
+            y_val_t = torch.tensor(y_val, dtype=torch.long, device=device)
+        elif self.task == "classification" and self.n_classes_ == 2:
+            y_train_t = torch.tensor(y_train, dtype=torch.float32, device=device).view(-1, 1)
+            y_val_t = torch.tensor(y_val, dtype=torch.float32, device=device).view(-1, 1)
+        else:
+            y_train_t = torch.tensor(y_train, dtype=torch.float32, device=device).view(-1, 1)
+            y_val_t = torch.tensor(y_val, dtype=torch.float32, device=device).view(-1, 1)
+
+        X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
+        X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
+
+        criterion = self._make_loss()
+        optimizer = torch.optim.AdamW(self.model_.parameters(), lr=self.lr, weight_decay=1e-4)
+
+        best_state = None
+        best_val = float("inf")
+        patience_left = self.patience
+
+        self.train_history_ = {"train_loss": [], "val_loss": []}
+
+        for epoch in range(self.epochs):
+            self.model_.train()
+
+            perm = torch.randperm(X_train_t.shape[0], device=device)
+            train_losses = []
+
+            for start in range(0, X_train_t.shape[0], self.batch_size):
+                idx = perm[start:start + self.batch_size]
+                xb = X_train_t[idx]
+                yb = y_train_t[idx]
+
+                optimizer.zero_grad()
+                logits, global_emb, feat_emb, attns = self.model_(xb, prior_bias=self.prior_bias_)
+
+                if self.task == "regression":
+                    loss = criterion(logits, yb)
+                elif self.n_classes_ == 2:
+                    loss = criterion(logits, yb)
+                else:
+                    loss = criterion(logits, yb.squeeze(-1).long())
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model_.parameters(), max_norm=5.0)
+                optimizer.step()
+
+                train_losses.append(loss.item())
+
+            self.model_.eval()
+            with torch.no_grad():
+                val_logits, _, _, _ = self.model_(X_val_t, prior_bias=self.prior_bias_)
+                if self.task == "regression":
+                    val_loss = criterion(val_logits, y_val_t).item()
+                elif self.n_classes_ == 2:
+                    val_loss = criterion(val_logits, y_val_t).item()
+                else:
+                    val_loss = criterion(val_logits, y_val_t.squeeze(-1).long()).item()
+
+            train_loss = float(np.mean(train_losses))
+            self.train_history_["train_loss"].append(train_loss)
+            self.train_history_["val_loss"].append(val_loss)
+
+            if self.verbose:
+                print(f"Epoch {epoch+1:03d} | train={train_loss:.5f} | val={val_loss:.5f}")
+
+            if val_loss < best_val - 1e-6:
+                best_val = val_loss
+                best_state = copy.deepcopy(self.model_.state_dict())
+                patience_left = self.patience
+            else:
+                patience_left -= 1
+                if patience_left <= 0:
+                    if self.verbose:
+                        print("Early stopping.")
+                    break
+
+        if best_state is not None:
+            self.model_.load_state_dict(best_state)
+
+        # Cache some summaries for explanation
+        self._compute_global_feature_summary(X, X_raw=X_raw)
+
+        return self
+
+    def _compute_global_feature_summary(self, X: np.ndarray, X_raw: Optional[np.ndarray] = None):
+        # Small summary used for explainability.
+        curves = self.ice_computer_.compute(
+            X,
+            grid_cache=self.grid_cache_,
+            sample_size=min(len(X), self.ice_max_samples if self.ice_max_samples is not None else len(X)),
+        )
+        Xg = self._pack_curves(curves)
+        logits, global_emb, feat_emb = self._predict_from_curves(Xg)
+
+        # attention summary from the last graph block
+        attn = self.model_.graph_blocks[-1].last_attn_
+        if attn is not None:
+            # (B,F,F) -> avg incoming attention per feature
+            incoming = attn.mean(dim=0).mean(dim=0)  # (F,)
+            self.feature_importance_attention_ = incoming.detach().cpu().numpy()
+        else:
+            self.feature_importance_attention_ = np.ones(self.n_features_in_, dtype=np.float32) / self.n_features_in_
+
+        self.feature_embedding_summary_ = feat_emb.mean(dim=0).detach().cpu().numpy()  # (F,D)
+
+        if X_raw is not None:
+            self.raw_grid_cache_ = self.grid_cache_.raw_grid_values
+        else:
+            self.raw_grid_cache_ = None
+
+    def _curves_from_X(self, X: np.ndarray) -> np.ndarray:
+        X = _to_numpy(X).astype(np.float32)
+        curves = self.ice_computer_.compute(
+            X,
+            grid_cache=self.grid_cache_,
+            sample_size=len(X),  # no subsampling at inference time
+        )
+        return self._pack_curves(curves)
+
+    def predict(self, X):
+        check_is_fitted(self, ["model_", "grid_cache_", "n_features_in_"])
+        Xg = self._curves_from_X(X)
+        logits, _, _ = self._predict_from_curves(Xg)
+
+        if self.task == "regression":
+            return logits.squeeze(-1).detach().cpu().numpy()
+
+        if self.n_classes_ == 2:
+            proba_pos = torch.sigmoid(logits).squeeze(-1).detach().cpu().numpy()
+            pred_idx = (proba_pos >= 0.5).astype(int)
+            return self.label_encoder_.inverse_transform(pred_idx)
+
+        pred_idx = torch.argmax(logits, dim=1).detach().cpu().numpy()
+        return self.label_encoder_.inverse_transform(pred_idx)
+
+    def predict_proba(self, X):
+        check_is_fitted(self, ["model_", "grid_cache_", "n_features_in_"])
+        if self.task != "classification":
+            raise ValueError("predict_proba est disponible uniquement pour la classification.")
+
+        Xg = self._curves_from_X(X)
+        logits, _, _ = self._predict_from_curves(Xg)
+
+        if self.n_classes_ == 2:
+            p1 = torch.sigmoid(logits).squeeze(-1)
+            p0 = 1.0 - p1
+            proba = torch.stack([p0, p1], dim=1)
+            return proba.detach().cpu().numpy()
+
+        proba = torch.softmax(logits, dim=1)
+        return proba.detach().cpu().numpy()
+
+    def get_embeddings(self, X, return_feature_embeddings: bool = False):
+        """
+        return_feature_embeddings=False -> embedding global (n_samples, hidden_dim)
+        return_feature_embeddings=True  -> embedding par feature (n_samples, n_features, hidden_dim)
+        """
+        check_is_fitted(self, ["model_", "grid_cache_", "n_features_in_"])
+        Xg = self._curves_from_X(X)
+        logits, global_emb, feat_emb = self._predict_from_curves(Xg)
+        if return_feature_embeddings:
+            return feat_emb.detach().cpu().numpy()
+        return global_emb.detach().cpu().numpy()
+
+    def explain_feature(self, X, feature_idx: int, X_raw: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Retourne une explication "smoothée" de la feature:
+        - grille ICE
+        - courbes moyennes
+        - bande de dispersion
+        - importance attention
+        - embedding moyen de la feature
+
+        X_raw est optionnel et sert à afficher la grille en unités brutes.
+        """
+        check_is_fitted(self, ["model_", "grid_cache_", "n_features_in_"])
+        X = _to_numpy(X).astype(np.float32)
+
+        curves = self.ice_computer_.compute(
+            X,
+            grid_cache=self.grid_cache_,
+            sample_size=len(X),
+        )
+        # feature slice: (n_samples, grid, out_dim)
+        c = curves[:, feature_idx, :, :]
+
+        mean_curve = c.mean(axis=0)          # (grid, out_dim)
+        std_curve = c.std(axis=0)            # (grid, out_dim)
+        median_curve = np.median(c, axis=0)  # (grid, out_dim)
+
+        raw_axis = None
+        if X_raw is not None:
+            X_raw = _to_numpy(X_raw).astype(np.float32)
+            raw_axis = self.grid_cache_.raw_grid_values[feature_idx] if self.grid_cache_.raw_grid_values is not None else None
+
+        result = {
+            "feature_idx": feature_idx,
+            "feature_name": self.feature_names_[feature_idx],
+            "grid": self.grid_cache_.grid_values[feature_idx],
+            "raw_grid": raw_axis,
+            "mean_curve": mean_curve,
+            "median_curve": median_curve,
+            "std_curve": std_curve,
+            "attention_importance": float(self.feature_importance_attention_[feature_idx])
+            if hasattr(self, "feature_importance_attention_") else None,
+            "feature_embedding_summary": self.feature_embedding_summary_[feature_idx]
+            if hasattr(self, "feature_embedding_summary_") else None,
+        }
+        return result
+
+    def explain(self, X, X_raw: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Explication globale:
+        - embeddings globaux
+        - embeddings par feature
+        - importance par attention
+        - courbes moyennes par feature
+        """
+        check_is_fitted(self, ["model_", "grid_cache_", "n_features_in_"])
+
+        global_emb = self.get_embeddings(X, return_feature_embeddings=False)
+        feat_emb = self.get_embeddings(X, return_feature_embeddings=True)
+
+        explanations = {
+            "global_embedding": global_emb,
+            "feature_embeddings": feat_emb,
+            "feature_importance_attention": getattr(self, "feature_importance_attention_", None),
+            "feature_names": self.feature_names_,
+            "grid_values": self.grid_cache_.grid_values,
+            "raw_grid_values": self.grid_cache_.raw_grid_values if X_raw is not None else None,
+            "per_feature": [],
+        }
+
+        for j in range(self.n_features_in_):
+            explanations["per_feature"].append(self.explain_feature(X, j, X_raw=X_raw))
+
+        return explanations
+
+
+# ============================================================
+# sklearn-like user classes
+# ============================================================
+
+class IceGNNRegressor(IceGNNBase, RegressorMixin):
+    def __init__(self, pretrained_learner, **kwargs):
+        super().__init__(pretrained_learner=pretrained_learner, task="regression", **kwargs)
+
+
+class IceGNNClassifier(IceGNNBase, ClassifierMixin):
+    def __init__(self, pretrained_learner, **kwargs):
+        super().__init__(pretrained_learner=pretrained_learner, task="classification", **kwargs)
