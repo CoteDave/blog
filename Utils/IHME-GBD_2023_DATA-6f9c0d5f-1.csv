@@ -1,0 +1,10 @@
+population_group_id,population_group_name,measure_id,measure_name,location_id,location_name,sex_id,sex_name,age_id,age_name,cause_id,cause_name,rei_id,rei_name,metric_id,metric_name,year,val,upper,lower
+1,Toute la population,1,Décès,101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,1,#,2023,156687.85643883297,167748.99220205567,144615.83443869348
+1,Toute la population,1,Décès,101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,2,%,2023,0.4879062936928622,0.5183907476955822,0.4504698366402854
+1,Toute la population,1,Décès,101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,3,Taux,2023,408.01595372312374,436.8192059997548,376.5803486819872
+1,Toute la population,2,AVAIs (Années de Vie Ajustées en fonction de l’Incapacité),101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,1,#,2023,4823609.18969426,5431172.659280257,4312014.493920386
+1,Toute la population,2,AVAIs (Années de Vie Ajustées en fonction de l’Incapacité),101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,2,%,2023,0.39612532782835685,0.42282354865117333,0.3687751641427899
+1,Toute la population,2,AVAIs (Années de Vie Ajustées en fonction de l’Incapacité),101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,3,Taux,2023,12560.702205336687,14142.800487389784,11228.507085306086
+1,Toute la population,3,AVI (Années Vécues avec une Incapacité),101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,1,#,2023,1868194.1652196213,2415650.924300774,1390288.343124392
+1,Toute la population,3,AVI (Années Vécues avec une Incapacité),101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,2,%,2023,0.30149153973682974,0.33194406505277396,0.2727451219877992
+1,Toute la population,3,AVI (Années Vécues avec une Incapacité),101,Canada,3,Les deux,22,Tout age,294,Toutes causes,169,Tous les facteurs de risque,3,Taux,2023,4864.786853214899,6290.366963603772,3620.317726992993
